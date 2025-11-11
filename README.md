@@ -1,5 +1,3 @@
-## Thanks
-
 > **Important for repository owners:** This README references Telegram integration (e.g. `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, and topic IDs). The sample values commonly seen in example scripts may belong to the author — **replace them with your own values** or remove the Telegram integration entirely before publishing. **Do not commit real tokens or sensitive data** to a public repository. In your final release you should remove any example tokens/IDs.
 
 # Amatrasu 🔥
