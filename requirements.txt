@@ -1,0 +1,23 @@
+# Amatrasu - requirements.txt
+# Target: Python 3.8+
+# Only non-stdlib dependencies are listed. Some packages (requests) bring their own deps,
+# but we list common ones with minimum versions for reproducibility.
+
+requests>=2.28
+urllib3>=1.26
+certifi>=2023.5.7
+chardet>=4.0
+idna>=3.3
+
+# Optional: waf detection (the script currently calls wafw00f via subprocess if installed).
+# You can install wafw00f as a Python package OR as a system CLI tool.
+# Uncomment to install the Python package:
+# wafw00f>=2.1
+
+# Optional: convenience for loading secrets from a .env file (recommended instead of hardcoding tokens)
+python-dotenv>=1.0
+
+# Optional: useful developer tools (not required to run the script)
+# colorama for better console colors on Windows, and pytest for tests if you add them.
+colorama>=0.4
+pytest>=7.0
