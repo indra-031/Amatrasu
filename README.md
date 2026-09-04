@@ -1,4 +1,3 @@
-````markdown
 # 🔥 Amatrasu
 
 **HTTP Basic Auth Brute Forcer**
@@ -483,4 +482,3 @@ Built for authorized security research.
 
 Stay curious.  
 Stay ethical.
-````
