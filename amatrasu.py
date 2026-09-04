@@ -260,7 +260,7 @@ def run_brute_on_domain(domain: str, users, passes, args, retry_mode=False, sile
         return False, waf_detected
 
     if not silent:
-        print(f"[+] {'Retry' if retry_mode else 'Brute'} {domain}: {total} attempts → {threads} threads")
+        print(f"[+] {'Retry' if retry_mode else 'Brute Force on'} {domain}: {total} attempts → {threads} threads")
     else:
         print(f"[+] Starting {domain}: {total} attempts")
 
